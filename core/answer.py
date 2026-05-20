@@ -388,7 +388,7 @@ def fetch_context_with_options(
     question: str,
     session_id: str | None = None,
     provider: str = "Local (LM Studio)",
-    allow_web_fallback: bool = True,
+    allow_web_fallback: bool = False,
     is_custom_mode: bool = False,
 ) -> list[Result]:
     """Retrieve context with optional suppression of web fallback for custom sessions."""
@@ -520,7 +520,7 @@ def answer_question(
     history: list[dict] | None = None,
     session_id: str | None = None,
     provider: str = "Local (LM Studio)",
-    allow_web_fallback: bool = True,
+    allow_web_fallback: bool = False,
     is_custom_mode: bool = False,
 ) -> tuple[str, list]:
     """Answer a question using the RAG pipeline. Returns (answer, context_docs)."""
@@ -559,12 +559,18 @@ def answer_question(
                     "or upload a more relevant document."
                 )
         else:
-            # Default mode — web search was also tried and failed
-            msg = (
-                "This topic was not found in the provided documents, "
-                "and the web search did not return any results either. "
-                "Try uploading a relevant document or rephrasing your question."
-            )
+            if allow_web_fallback:
+                msg = (
+                    "This topic was not found in the provided documents, "
+                    "and the web search did not return any reliable results either. "
+                    "Try uploading a relevant document or rephrasing your question."
+                )
+            else:
+                msg = (
+                    "This topic was not found in the built-in documents. "
+                    "Ask about the indexed knowledge base, switch to Custom mode and add relevant documents, "
+                    "or rephrase your question with terms from the documents."
+                )
         return msg, []
 
     # Check intent to determine if structured aggregation is needed

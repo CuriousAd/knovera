@@ -136,7 +136,7 @@ def chat_with_mode(history, mode, session_id, def_hist, cust_hist, def_ctx, cust
             chunks_added = ingest_document(structured_md, source_name, session_id)
             add_to_session_size(session_id, text_size)
 
-            reply = f"Scraped **{source_name}** and indexed {chunks_added} chunks. Ask me anything about it."
+            reply = f"Scraped **{source_name}** and added it to your document workspace ({chunks_added} chunks indexed). Ask about this source when you're ready."
             new_docs_md = (
                 f"**{source_name}** - web ({chunks_added} chunks)"
                 if "No documents yet" in current_docs_md
@@ -155,7 +155,7 @@ def chat_with_mode(history, mode, session_id, def_hist, cust_hist, def_ctx, cust
 
             if chunks_added > 0:
                 add_to_session_size(session_id, len(last_message.encode("utf-8")))
-                reply = f"Added to context ({chunks_added} chunks indexed). Ask me anything about it."
+                reply = f"Added this text to your document workspace ({chunks_added} chunks indexed). Ask about your documents when you're ready."
                 new_docs_md = (
                     f"**{source_name}** ({chunks_added} chunks)"
                     if "No documents yet" in current_docs_md
@@ -175,7 +175,7 @@ def chat_with_mode(history, mode, session_id, def_hist, cust_hist, def_ctx, cust
             prior,
             session_id=session_id,
             provider=provider,
-            allow_web_fallback=True,
+            allow_web_fallback=False,
             is_custom_mode=True
         )
 
@@ -486,7 +486,11 @@ def main():
         cust_ctx = gr.State("*Retrieved context will appear here*")
 
         with gr.Row(equal_height=True):
-            gr.Markdown("# DocuFlux AI\nAsk me anything about the documents!")
+            gr.Markdown(
+                "# DocuFlux AI\n"
+                "Ask about your documents. Paste text in Custom mode to add it as context. "
+                "This is a document-grounded RAG assistant, not a general chatbot."
+            )
 
         with gr.Tabs():
             with gr.Tab("Assistant", id=0):
@@ -494,8 +498,8 @@ def main():
                     mode = gr.Radio(
                         ["Default (Built-in KB)", "Custom (Upload Files)"],
                         value="Default (Built-in KB)",
-                        label="Search Mode",
-                        info="Default uses built-in KB. Custom uses uploaded docs first, then web fallback if needed.",
+                        label="Document Workspace",
+                        info="Default searches the built-in KB. Custom searches only your uploaded, pasted, or scraped session documents.",
                         scale=2,
                     )
                     llm_selector = gr.Dropdown(
@@ -514,7 +518,7 @@ def main():
                             chatbot_kwargs["show_copy_button"] = True
                         chatbot = gr.Chatbot(**chatbot_kwargs)
                         message = gr.Textbox(
-                            placeholder="Message AI Assistant...",
+                            placeholder="Ask about your documents, or paste text in Custom mode to add it as context...",
                             show_label=False,
                         )
                         clear_btn = gr.Button("Clear Current Chat", variant="secondary")

@@ -32,7 +32,7 @@ A production-grade Retrieval-Augmented Generation (RAG) assistant with two disti
 
 ## Modes at a Glance
 
-DocuFlux AI exposes two modes from a single UI toggle. They share the same retrieval and answering pipeline (`core/answer.py`) but target different vector databases and have different data isolation guarantees.
+DocuFlux AI exposes two document-grounded modes from a single UI toggle. They share the same retrieval and answering pipeline (`core/answer.py`) but target different vector databases and have different data isolation guarantees. This is a RAG assistant for document Q&A, not a general chatbot.
 
 | | Default Mode | Custom Mode |
 |---|---|---|
@@ -41,7 +41,7 @@ DocuFlux AI exposes two modes from a single UI toggle. They share the same retri
 | **Accepts Uploads** | No | Yes — PDF, DOCX, TXT, MD, PNG, JPG, JPEG |
 | **Accepts URLs** | No | Yes — scraped and indexed in real time |
 | **Accepts Pasted Text** | No | Yes — AI-classified before ingesting |
-| **Web Fallback** | Yes — DuckDuckGo when KB has no answer | Yes — triggered when session DB has no relevant chunks |
+| **Web Fallback** | No — strict built-in KB answers only | No — strict session document answers only |
 | **Chat History** | Persists while on Default tab | Persists while on Custom tab — separate from Default |
 | **Privacy** | Shared KB accessible to all users | Fully isolated per browser session |
 
@@ -51,7 +51,7 @@ DocuFlux AI exposes two modes from a single UI toggle. They share the same retri
 
 ### Dual-Mode Intelligence
 - **Default Mode** queries a pre-built static knowledge base (company documentation, contracts, products). Use it as a domain-specific expert assistant with zero setup.
-- **Custom Mode** creates a private, isolated vector database per browser session. Anything you upload, scrape, or paste becomes the sole source of truth for your conversation.
+- **Custom Mode** creates a private, isolated vector database per browser session. Anything you upload, scrape, or paste is added to your document workspace and becomes the sole source of truth for that conversation.
 
 ### Multi-Provider LLM Selector
 Switch providers at runtime from the UI dropdown. Only providers with a valid API key are shown:
@@ -61,12 +61,8 @@ Switch providers at runtime from the UI dropdown. Only providers with a valid AP
 
 On HuggingFace Spaces, the Local provider is hidden automatically since LM Studio cannot run there.
 
-### Agentic Web Fallback (DuckDuckGo)
-When no relevant context is found in the active database, the system automatically falls back to a live DuckDuckGo web search. It uses two strategies in sequence:
-1. **HTML scraping** (`html.duckduckgo.com`) — works even in sandboxed environments.
-2. **`ddgs` API** — faster JSON-based search as a secondary path.
-
-Web-sourced answers are clearly labeled with a disclaimer. Web results fetched in Custom Mode are also auto-ingested into the session database for future retrieval.
+### Strict Document Grounding
+When no relevant context is found in the active database, the assistant says the answer was not found in the documents instead of searching random web pages. This keeps answers grounded in the indexed knowledge base or the user's Custom Mode document workspace.
 
 ### Agentic Query Pipeline
 Each user query passes through several intelligent stages before reaching the LLM:
@@ -123,7 +119,7 @@ DocuFlux AI/
 │
 ├── core/
 │   ├── config.py           # Centralized config: providers, DB paths, chunk settings
-│   ├── answer.py           # Full RAG pipeline: retrieval, reranking, LLM, web fallback
+│   ├── answer.py           # Full RAG pipeline: retrieval, reranking, grounded LLM answers
 │   ├── ingest.py           # Static KB ingestion script (run once, offline)
 │   ├── extractors.py       # Multi-format text extraction (PDF, DOCX, OCR, URL)
 │   ├── session_manager.py  # Session lifecycle: create, destroy, size tracking
@@ -159,11 +155,10 @@ graph TD
     GATE -->|No| EMPTY[Empty Context]
     RR --> REL{Keyword Overlap?}
     REL -->|Yes| INTENT[Intent Classifier]
-    REL -->|No| WEB[DuckDuckGo Web Fallback]
+    REL -->|No| EMPTY
     INTENT -->|lookup| LLM[LLM Answer]
     INTENT -->|analytical| STRUCT[Structured Extraction] --> LLM
-    EMPTY --> WEB
-    WEB --> LLM
+    EMPTY --> NOANS[No Document Answer]
     LLM --> ANS[Answer + Source Citations]
 ```
 
@@ -180,9 +175,7 @@ graph TD
     ING --> REPLY[Confirmation Message]
     RETR --> GATE{Relevant Chunks Found?}
     GATE -->|Yes| LLM[LLM Answer]
-    GATE -->|No| WEB[DuckDuckGo Fallback]
-    WEB --> AUTO[Auto-ingest Web Results to Session DB]
-    AUTO --> LLM
+    GATE -->|No| NOANS[No Document Answer]
 ```
 
 ### Chunking and Embedding Parameters
@@ -310,4 +303,3 @@ Set `AI_EVAL_ENABLED=false` in `.env` to disable AI evaluation and run retrieval
 | Session docs panel display | Latest 5 files shown | `MAX_VISIBLE_DOCS` in `app.py` |
 | Retrieval candidates | 10 chunks | `RETRIEVAL_K` env var |
 | Final chunks after rerank | 6 chunks | `FINAL_K` env var |
-| Web search results | 5 results | `WEB_SEARCH_K` in `answer.py` |
