@@ -37,18 +37,29 @@ Context:
 {context}
 """
 
-WEB_FALLBACK_PROMPT = """You are a helpful assistant. The user's question was NOT found in the provided documents, so the context below was retrieved from a live web search.
+WEB_FALLBACK_PROMPT = """You are a helpful assistant. The context below was retrieved from a live web search.
 
 IMPORTANT RULES:
 1. ALWAYS begin your answer with this exact disclaimer on its own line:
-   > [Web Search] This topic wasn't found in your provided documents. The following answer is based on a live web search.
+   > [Web Search] The following answer is based on a live web search.
 2. Answer ONLY using the web search context below. Do not add facts from your training data.
 3. If the web context below is clearly irrelevant or insufficient to answer the question, respond with:
-   > [Web Search] This topic wasn't found in your provided documents, and the web search also didn't return a reliable answer. Try uploading a relevant document.
+   > [Web Search] The web search didn't return a reliable answer. Try rephrasing or adding a relevant document.
 4. NEVER fabricate details not present in the context.
 5. Cite the source URL at the end of your answer when available.
 
 Web Search Context:
+{context}
+"""
+
+DIRECT_ANSWER_PROMPT = """You are a helpful assistant. Answer the user directly.
+
+If Active Context is provided, use it as the primary material for the answer.
+If the user asks for code, provide a clear solution and briefly explain the approach.
+If the user asks for a summary, summarize only the provided material.
+Do not claim that the answer came from uploaded documents unless document context is explicitly provided.
+
+Active Context:
 {context}
 """
 
@@ -430,6 +441,69 @@ def build_context(chunks: list[Result], max_chars: int = MAX_CONTEXT_CHARS) -> s
         parts.append(snippet)
         used += len(snippet) + 2
     return "\n\n".join(parts)
+
+
+def answer_directly(
+    question: str,
+    history: list[dict] | None = None,
+    provider: str = "Local (LM Studio)",
+    active_context: str = "",
+) -> tuple[str, list]:
+    """Answer without retrieval for math, coding, summaries, and general questions."""
+    if history is None:
+        history = []
+
+    context = active_context.strip() or "None"
+    messages = [SystemMessage(content=DIRECT_ANSWER_PROMPT.format(context=context))]
+    messages.extend(convert_to_messages(history))
+    messages.append(HumanMessage(content=question))
+
+    try:
+        response = get_llm(provider).invoke(messages)
+        return response.content, []
+    except Exception as e:
+        err_str = str(e)
+        return (
+            f"**Could not reach '{provider}'** - {err_str[:200]}\n\n"
+            "Please check your API key or try a different provider.",
+            [],
+        )
+
+
+def answer_from_web_search(
+    question: str,
+    history: list[dict] | None = None,
+    provider: str = "Local (LM Studio)",
+) -> tuple[str, list]:
+    """Answer using live web search results only."""
+    if history is None:
+        history = []
+
+    chunks = fallback_web_search(question)
+    if not chunks:
+        return (
+            "The web search did not return a reliable answer. Try rephrasing or adding a relevant document.",
+            [],
+        )
+
+    context = build_context(chunks)
+    messages = [SystemMessage(content=WEB_FALLBACK_PROMPT.format(context=context))]
+    messages.extend(convert_to_messages(history))
+    messages.append(HumanMessage(content=question))
+
+    try:
+        response = get_llm(provider).invoke(messages)
+        answer_text = response.content
+    except Exception as e:
+        err_str = str(e)
+        answer_text = (
+            f"**Could not reach '{provider}'** - {err_str[:200]}\n\n"
+            "---\n*Here are the most relevant web results found:*\n\n"
+            f"{context}"
+        )
+
+    docs = [Document(page_content=c.page_content, metadata=c.metadata) for c in chunks]
+    return answer_text, docs
 
 
 def classify_input(text: str, provider: str = "Local (LM Studio)") -> str:

@@ -32,7 +32,7 @@ A production-grade Retrieval-Augmented Generation (RAG) assistant with two disti
 
 ## Modes at a Glance
 
-DocuFlux AI exposes two document-grounded modes from a single UI toggle. They share the same retrieval and answering pipeline (`core/answer.py`) but target different vector databases and have different data isolation guarantees. This is a RAG assistant for document Q&A, not a general chatbot.
+DocuFlux AI exposes two modes from a single UI toggle. Default Mode is strict built-in KB RAG. Custom Mode is document-first: it searches the user's workspace first, then uses direct answering for simple math, coding, summaries, and general questions, or web search for current public information.
 
 | | Default Mode | Custom Mode |
 |---|---|---|
@@ -40,8 +40,8 @@ DocuFlux AI exposes two document-grounded modes from a single UI toggle. They sh
 | **Data Persistence** | Permanent — committed to repository | Wiped on reset or server shutdown |
 | **Accepts Uploads** | No | Yes — PDF, DOCX, TXT, MD, PNG, JPG, JPEG |
 | **Accepts URLs** | No | Yes — scraped and indexed in real time |
-| **Accepts Pasted Text** | No | Yes — AI-classified before ingesting |
-| **Web Fallback** | No — strict built-in KB answers only | No — strict session document answers only |
+| **Accepts Pasted Text** | No | Yes — routed as task input or workspace context |
+| **Fallback Behavior** | No fallback — strict built-in KB answers only | Direct answer for simple/general tasks; web search for current public information |
 | **Chat History** | Persists while on Default tab | Persists while on Custom tab — separate from Default |
 | **Privacy** | Shared KB accessible to all users | Fully isolated per browser session |
 
@@ -51,7 +51,7 @@ DocuFlux AI exposes two document-grounded modes from a single UI toggle. They sh
 
 ### Dual-Mode Intelligence
 - **Default Mode** queries a pre-built static knowledge base (company documentation, contracts, products). Use it as a domain-specific expert assistant with zero setup.
-- **Custom Mode** creates a private, isolated vector database per browser session. Anything you upload, scrape, or paste is added to your document workspace and becomes the sole source of truth for that conversation.
+- **Custom Mode** creates a private, isolated vector database per browser session. Anything you upload, scrape, or paste can be added to your document workspace, while explicit tasks such as summarizing pasted text or solving coding prompts are answered directly.
 
 ### Multi-Provider LLM Selector
 Switch providers at runtime from the UI dropdown. Only providers with a valid API key are shown:
@@ -61,8 +61,8 @@ Switch providers at runtime from the UI dropdown. Only providers with a valid AP
 
 On HuggingFace Spaces, the Local provider is hidden automatically since LM Studio cannot run there.
 
-### Strict Document Grounding
-When no relevant context is found in the active database, the assistant says the answer was not found in the documents instead of searching random web pages. This keeps answers grounded in the indexed knowledge base or the user's Custom Mode document workspace.
+### Document-First Custom Mode
+Custom Mode uses a fast local router before retrieval. Long pasted text with a task such as "summarize", "solve", or "explain" is answered directly from the pasted material. Long pasted text without a task is added to the workspace. Short follow-ups such as "cpp solution" can use the current scratchpad context, and web search is reserved for current or public lookup questions.
 
 ### Agentic Query Pipeline
 Each user query passes through several intelligent stages before reaching the LLM:
@@ -74,14 +74,16 @@ Each user query passes through several intelligent stages before reaching the LL
 6. **Relevance Gate** — A final post-rerank check discards chunks with zero keyword overlap, preventing irrelevant context from reaching the LLM.
 7. **Intent Classification** — The query is classified as `lookup` or `analytical`. Analytical queries trigger a structured pre-extraction step before the final answer.
 
-### AI Auto-Classification (Custom Mode)
-When you type or paste text in Custom Mode, the system classifies your input before acting:
-- **Short input (< 100 chars) or ends with `?`** — treated as a question, routed to retrieval.
-- **Long input (> 500 chars)** — treated as document content, ingested immediately.
-- **Medium input (100–500 chars)** — classified by the LLM; falls back to heuristics if the LLM is unreachable.
+### Intent Routing (Custom Mode)
+When you type or paste text in Custom Mode, the system routes the input before acting:
+- **Document questions** — search uploaded, pasted, or scraped workspace documents first.
+- **Long text with task intent** — answer directly using the pasted text.
+- **Long text without task intent** — add it to the document workspace.
+- **Math, coding, greetings, and general concepts** — answer directly.
+- **Current/latest/public lookup questions** — use web search.
 
-### Strict Anti-Hallucination
-The LLM prompt enforces strict grounding rules:
+### Document Answer Grounding
+When the assistant answers from retrieved documents, the LLM prompt enforces strict grounding rules:
 - Answer only from retrieved context.
 - Explicitly cite the source document for every major claim.
 - Disclose conflicts if multiple sources disagree.
@@ -162,20 +164,25 @@ graph TD
     LLM --> ANS[Answer + Source Citations]
 ```
 
-### Custom Mode — Input Classification and Ingestion
+### Custom Mode - Intent Routing, Retrieval, and Fallbacks
 
 ```mermaid
 graph TD
     INPUT[User Input] --> TYPE{Input Type?}
     TYPE -->|URL detected| SCRAPE[Web Scraper]
-    TYPE -->|Text input| CLS{AI Classifier}
-    CLS -->|context| ING[Ingest to Session DB]
-    CLS -->|query| RETR[Session DB Retrieval]
+    TYPE -->|Text input| ROUTE{Fast Intent Router}
+    ROUTE -->|Long text only| ING[Ingest to Session DB]
+    ROUTE -->|Pasted text + task| DIRECT[Direct Answer]
+    ROUTE -->|Math or coding task| DIRECT
+    ROUTE -->|Follow-up task| SCRATCH[Scratchpad Context] --> DIRECT
+    ROUTE -->|Current public info| WEB[Web Search]
+    ROUTE -->|Document question| RETR[Session DB Retrieval]
     SCRAPE --> ING
     ING --> REPLY[Confirmation Message]
     RETR --> GATE{Relevant Chunks Found?}
     GATE -->|Yes| LLM[LLM Answer]
-    GATE -->|No| NOANS[No Document Answer]
+    GATE -->|No| DIRECT
+    WEB --> LLM
 ```
 
 ### Chunking and Embedding Parameters

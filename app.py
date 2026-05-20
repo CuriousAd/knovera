@@ -8,7 +8,7 @@ from datetime import datetime
 import gradio as gr
 import pandas as pd
 
-from core.answer import answer_question, classify_input
+from core.answer import answer_directly, answer_from_web_search, answer_question
 from core.config import AVAILABLE_PROVIDERS
 from core.extractors import extract_file, extract_url, structure_as_markdown
 from core.session_ingest import ingest_document
@@ -42,6 +42,32 @@ ANSWER_GREEN = 4.5
 ANSWER_AMBER = 4.0
 
 _URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+_SIMPLE_MATH_RE = re.compile(r"^[\d\s().,+\-*/%^=]+$")
+
+_TASK_WORDS = {
+    "summarize", "summary", "solve", "explain", "implement", "write", "convert",
+    "rewrite", "extract", "translate", "analyze", "compare", "debug", "fix",
+    "optimize", "generate", "create",
+}
+_INGEST_WORDS = {
+    "remember this", "save this", "add this", "add to context",
+    "use this as context", "store this", "keep this",
+}
+_WEB_WORDS = {
+    "latest", "current", "today", "recent", "news", "price", "pricing",
+    "search web", "web search", "look up", "lookup online",
+}
+_FOLLOWUP_TASK_WORDS = {
+    "it", "that", "this", "solve that", "explain it", "summarize it",
+    "cpp solution", "c++ solution", "python solution", "java solution",
+    "code", "solution", "summarize", "solve", "explain",
+}
+_CHAT_WORDS = {"hi", "hello", "hey", "thanks", "thank you"}
+_CODE_MARKERS = {
+    "constraints:", "example 1", "example 2", "input:", "output:",
+    "return the", "class solution", "leetcode", "time complexity",
+}
+_session_scratchpads: dict[str, dict] = {}
 
 
 def trim_docs_list(md_text: str) -> str:
@@ -70,6 +96,105 @@ def extract_text_content(content) -> str:
 def is_url(text: str) -> bool:
     """Return True if the entire stripped input is a single URL."""
     return bool(_URL_RE.match(text.strip()))
+
+
+def get_scratchpad(session_id: str) -> dict:
+    """Return short-term working memory for the custom session."""
+    return _session_scratchpads.setdefault(session_id, {})
+
+
+def set_scratchpad_context(session_id: str, text: str, topic: str, source: str = "user_input") -> dict:
+    """Store recent working material for follow-up turns like 'solve that'."""
+    scratchpad = get_scratchpad(session_id)
+    scratchpad.update({
+        "active_context": text[-12000:],
+        "active_topic": topic,
+        "active_source": source,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    return scratchpad
+
+
+def clear_scratchpad(session_id: str) -> None:
+    _session_scratchpads.pop(session_id, None)
+
+
+def has_session_documents(current_docs_md: str) -> bool:
+    return bool(current_docs_md and "No documents yet" not in current_docs_md)
+
+
+def looks_like_math(text: str) -> bool:
+    stripped = text.strip()
+    if re.search(r"\d", stripped) and _SIMPLE_MATH_RE.match(stripped):
+        return True
+    lowered = stripped.lower().rstrip("?")
+    for prefix in ("what is", "calculate", "compute", "solve"):
+        if lowered.startswith(prefix):
+            expr = lowered[len(prefix):].strip()
+            if re.search(r"\d", expr) and _SIMPLE_MATH_RE.match(expr):
+                return True
+    return False
+
+
+def looks_like_code_task(text: str) -> bool:
+    lowered = text.lower()
+    if any(marker in lowered for marker in _CODE_MARKERS):
+        return True
+    return bool(
+        re.search(r"\b(def|class|function|vector<|#include|public:|return)\b", lowered)
+        and any(word in lowered for word in ["solve", "implement", "debug", "fix", "error"])
+    )
+
+
+def has_task_intent(text: str) -> bool:
+    lowered = text.lower()
+    return any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in _TASK_WORDS)
+
+
+def has_ingest_intent(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _INGEST_WORDS)
+
+
+def has_web_intent(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _WEB_WORDS)
+
+
+def looks_like_followup_task(text: str, scratchpad: dict) -> bool:
+    if not scratchpad.get("active_context"):
+        return False
+    lowered = text.lower().strip()
+    if len(lowered.split()) <= 4 and any(token in lowered for token in _FOLLOWUP_TASK_WORDS):
+        return True
+    return any(phrase in lowered for phrase in _FOLLOWUP_TASK_WORDS)
+
+
+def route_custom_message(text: str, current_docs_md: str, scratchpad: dict) -> str:
+    """Fast local router for Custom mode."""
+    stripped = text.strip()
+    lowered = stripped.lower()
+    long_text = len(stripped) > 500 or stripped.count("\n") >= 8
+
+    if has_ingest_intent(stripped):
+        return "ingest_context"
+    if lowered in _CHAT_WORDS:
+        return "direct_answer"
+    if looks_like_math(stripped):
+        return "direct_answer"
+    if looks_like_followup_task(stripped, scratchpad):
+        return "followup_task"
+    if long_text and (has_task_intent(stripped) or looks_like_code_task(stripped)):
+        return "task_on_pasted_text"
+    if looks_like_code_task(stripped):
+        return "coding_task"
+    if has_web_intent(stripped):
+        return "web_question"
+    if long_text:
+        return "ingest_context"
+    if lowered.startswith(("what is ", "what are ", "how do ", "how does ", "explain ")):
+        return "document_question" if has_session_documents(current_docs_md) else "direct_answer"
+    return "document_question"
 
 
 def format_context(context):
@@ -117,6 +242,8 @@ def chat_with_mode(history, mode, session_id, def_hist, cust_hist, def_ctx, cust
     prior = history[:-1]
 
     if "Custom" in mode:
+        scratchpad = get_scratchpad(session_id)
+
         if is_url(last_message):
             url = last_message.strip()
             source_name = url.split("//")[-1].split("/")[0]
@@ -135,6 +262,7 @@ def chat_with_mode(history, mode, session_id, def_hist, cust_hist, def_ctx, cust
             structured_md = structure_as_markdown(text, source_name)
             chunks_added = ingest_document(structured_md, source_name, session_id)
             add_to_session_size(session_id, text_size)
+            set_scratchpad_context(session_id, text, source_name, source="url")
 
             reply = f"Scraped **{source_name}** and added it to your document workspace ({chunks_added} chunks indexed). Ask about this source when you're ready."
             new_docs_md = (
@@ -146,15 +274,47 @@ def chat_with_mode(history, mode, session_id, def_hist, cust_hist, def_ctx, cust
             size_md = f"**Size:** {format_size(get_session_size(session_id))} / 50 MB"
             return history, "*Web page ingested as context.*", def_hist, history, def_ctx, "*Web page ingested as context.*", trim_docs_list(new_docs_md), size_md
 
-        classification = classify_input(last_message, provider)
+        route = route_custom_message(last_message, current_docs_md, scratchpad)
 
-        if classification == "context":
+        if route in {"direct_answer", "coding_task", "task_on_pasted_text", "followup_task"}:
+            active_context = ""
+            if route == "followup_task":
+                active_context = scratchpad.get("active_context", "")
+            elif route == "task_on_pasted_text":
+                active_context = last_message
+                set_scratchpad_context(session_id, last_message, "Pasted task", source="pasted_text")
+            elif route == "coding_task":
+                active_context = last_message if len(last_message) > 300 else scratchpad.get("active_context", "")
+                if len(last_message) > 300:
+                    set_scratchpad_context(session_id, last_message, "Coding task", source="pasted_text")
+
+            answer, context = answer_directly(
+                last_message,
+                prior,
+                provider=provider,
+                active_context=active_context,
+            )
+            history.append({"role": "assistant", "content": answer})
+            ctx_display = (
+                "*Answered directly"
+                + (" using the current working context.*" if active_context else " without document retrieval.*")
+            )
+            return history, ctx_display, def_hist, history, def_ctx, ctx_display, current_docs_md, gr.update()
+
+        if route == "web_question":
+            answer, context = answer_from_web_search(last_message, prior, provider=provider)
+            formatted_ctx = format_context(context)
+            history.append({"role": "assistant", "content": answer})
+            return history, formatted_ctx, def_hist, history, def_ctx, formatted_ctx, current_docs_md, gr.update()
+
+        if route == "ingest_context":
             source_name = f"User Input {datetime.now().strftime('%H:%M:%S')}"
             structured_md = structure_as_markdown(last_message, source_name)
             chunks_added = ingest_document(structured_md, source_name, session_id)
 
             if chunks_added > 0:
                 add_to_session_size(session_id, len(last_message.encode("utf-8")))
+                set_scratchpad_context(session_id, last_message, source_name, source="pasted_text")
                 reply = f"Added this text to your document workspace ({chunks_added} chunks indexed). Ask about your documents when you're ready."
                 new_docs_md = (
                     f"**{source_name}** ({chunks_added} chunks)"
@@ -178,6 +338,16 @@ def chat_with_mode(history, mode, session_id, def_hist, cust_hist, def_ctx, cust
             allow_web_fallback=False,
             is_custom_mode=True
         )
+
+        if not context:
+            if has_web_intent(last_message):
+                answer, context = answer_from_web_search(last_message, prior, provider=provider)
+            else:
+                direct_answer, _ = answer_directly(last_message, prior, provider=provider)
+                answer = (
+                    "I couldn't find this in your document workspace, so here's a general answer:\n\n"
+                    f"{direct_answer}"
+                )
 
         new_docs_md = current_docs_md
         web_sources = set()
@@ -290,6 +460,7 @@ def handle_upload(files, session_id, current_docs_md):
 def reset_current_mode(mode, old_session_id, def_hist, cust_hist, def_ctx, cust_ctx, docs_list, size_bar):
     if "Custom" in mode:
         destroy_session(old_session_id)
+        clear_scratchpad(old_session_id)
         new_id = create_session()
         cust_hist = []
         cust_ctx = "*Retrieved context will appear here*"
@@ -488,8 +659,8 @@ def main():
         with gr.Row(equal_height=True):
             gr.Markdown(
                 "# DocuFlux AI\n"
-                "Ask about your documents. Paste text in Custom mode to add it as context. "
-                "This is a document-grounded RAG assistant, not a general chatbot."
+                "Default mode answers from the built-in KB. Custom mode searches your documents first, "
+                "then can answer simple math, coding, summaries, and general questions directly."
             )
 
         with gr.Tabs():
@@ -499,7 +670,7 @@ def main():
                         ["Default (Built-in KB)", "Custom (Upload Files)"],
                         value="Default (Built-in KB)",
                         label="Document Workspace",
-                        info="Default searches the built-in KB. Custom searches only your uploaded, pasted, or scraped session documents.",
+                        info="Default is strict built-in KB. Custom is document-first, with direct answers for simple/general tasks and web for current info.",
                         scale=2,
                     )
                     llm_selector = gr.Dropdown(
@@ -518,7 +689,7 @@ def main():
                             chatbot_kwargs["show_copy_button"] = True
                         chatbot = gr.Chatbot(**chatbot_kwargs)
                         message = gr.Textbox(
-                            placeholder="Ask about your documents, or paste text in Custom mode to add it as context...",
+                            placeholder="Ask about documents, paste text to summarize/save, or ask a simple coding/math question...",
                             show_label=False,
                         )
                         clear_btn = gr.Button("Clear Current Chat", variant="secondary")
