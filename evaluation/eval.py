@@ -13,27 +13,34 @@ from core.answer import answer_question, fetch_context
 from core.config import LM_STUDIO_BASE, MODEL_PROVIDERS
 from evaluation.test import TestQuestion, load_tests
 
-_EVAL_MODEL = MODEL_PROVIDERS["Local (LM Studio)"]["model"]
-
 _AI_EVAL_OVERRIDE = os.getenv("AI_EVAL_ENABLED", "").lower()
 AI_EVAL_ENABLED: bool = _AI_EVAL_OVERRIDE != "false"
 _judge_client = None
+_eval_model = None
 
 
 def _get_judge_client():
-    """Lazily initialise LM Studio client, return None if unavailable."""
-    global _judge_client
+    """Lazily initialise judge client from any configured provider."""
+    global _judge_client, _eval_model
     if _judge_client is not None:
         return _judge_client
+
     try:
         from openai import OpenAI
 
-        client = OpenAI(base_url=LM_STUDIO_BASE, api_key="lm-studio")
-        client.models.list()
-        _judge_client = client
-        return client
-    except Exception:
-        return None
+        for name, cfg in MODEL_PROVIDERS.items():
+            api_key = cfg.get("api_key")
+            base_url = cfg.get("base_url")
+            model = cfg.get("model")
+            if not api_key or not base_url:
+                continue
+            client = OpenAI(base_url=base_url, api_key=api_key, timeout=15.0)
+            _judge_client = client
+            _eval_model = model
+            return client
+    except Exception as e:
+        print(f"[Judge Init] Could not initialise judge client: {e}")
+    return None
 
 
 class RetrievalEval(BaseModel):
@@ -156,7 +163,7 @@ def evaluate_answer(test: TestQuestion) -> tuple[AnswerEval | None, str, list]:
 
     try:
         response = client.chat.completions.create(
-            model=_EVAL_MODEL,
+            model=_eval_model or "local-model",
             messages=judge_messages,
         )
         raw = response.choices[0].message.content.strip()

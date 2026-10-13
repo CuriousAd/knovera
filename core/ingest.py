@@ -56,14 +56,14 @@ def create_embeddings(chunks: list[dict]) -> None:
 
     if COLLECTION_NAME in [c.name for c in chroma.list_collections()]:
         chroma.delete_collection(COLLECTION_NAME)
-    collection = chroma.get_or_create_collection(COLLECTION_NAME)
+    collection = chroma.get_or_create_collection(COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
 
     texts = [c["text"] for c in chunks]
     metas = [c["metadata"] for c in chunks]
     ids = [str(i) for i in range(len(chunks))]
 
     print("Encoding chunks...")
-    vectors = get_embedder().encode(texts, show_progress_bar=True, batch_size=64).tolist()
+    vectors = get_embedder().encode(texts, show_progress_bar=True, batch_size=64, normalize_embeddings=True).tolist()
 
     collection.add(ids=ids, embeddings=vectors, documents=texts, metadatas=metas)
 

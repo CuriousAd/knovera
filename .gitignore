@@ -18,6 +18,7 @@ venv/
 
 # Generated data
 data/vector_db/
+data/sessions/
 temp/
 flagged/
 

@@ -1,17 +1,16 @@
 ---
-title: DocuFlux AI
+title: Knovera
 short_description: Agentic RAG assistant with multi-provider LLM support.
 colorFrom: indigo
 colorTo: purple
 sdk: gradio
+sdk_version: 5.20.0
 app_file: app.py
 pinned: false
 license: mit
 ---
 
-# DocuFlux AI - Dual-Mode RAG Assistant
-
-[![Live Demo on HuggingFace Spaces](https://img.shields.io/badge/HuggingFace-Live%20Demo-blue?style=for-the-badge)](https://huggingface.co/spaces/arcreactor19/DocuFlux-AI)
+# Knovera - Dual-Mode RAG Assistant
 
 A production-grade Retrieval-Augmented Generation (RAG) assistant with two distinct operating modes — a persistent built-in knowledge base and a fully isolated per-session document workspace. Built on ChromaDB, SentenceTransformers, and an OpenAI-compatible multi-provider LLM layer.
 
@@ -32,7 +31,7 @@ A production-grade Retrieval-Augmented Generation (RAG) assistant with two disti
 
 ## Modes at a Glance
 
-DocuFlux AI exposes two modes from a single UI toggle. Default Mode is strict built-in KB RAG. Custom Mode is document-first: it searches the user's workspace first, then uses direct answering for simple math, coding, summaries, and general questions, or web search for current public information.
+Knovera exposes two modes from a single UI toggle. Default Mode is strict built-in KB RAG. Custom Mode is document-first: it searches the user's workspace first, then uses direct answering for simple math, coding, summaries, and general questions, or web search for current public information.
 
 | | Default Mode | Custom Mode |
 |---|---|---|
@@ -113,7 +112,7 @@ Files in Custom Mode are fingerprinted with an MD5 hash before ingestion. Upload
 ## Project Structure
 
 ```
-DocuFlux AI/
+knovera/
 ├── app.py                  # Gradio UI — chat handlers, file upload, session wiring
 ├── packages.txt            # System dependencies for HuggingFace Spaces (Tesseract)
 ├── requirements.txt        # Python dependencies
@@ -268,7 +267,7 @@ Open `http://127.0.0.1:7860` in your browser.
 | Groq | llama-3.3-70b-versatile | 14,400 req/day, 30 req/min | [console.groq.com](https://console.groq.com) |
 | Mistral | mistral-small-latest | Free tier | [console.mistral.ai](https://console.mistral.ai) |
 
-If a provider's quota is exhausted, DocuFlux returns the raw retrieved context alongside a clear rate-limit message so you are never left with nothing.
+If a provider's quota is exhausted, Knovera returns the raw retrieved context alongside a clear rate-limit message so you are never left with nothing.
 
 ---
 

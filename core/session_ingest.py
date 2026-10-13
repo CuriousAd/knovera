@@ -6,7 +6,7 @@ from core.session_manager import get_session_client
 def get_session_collection(session_id: str):
     """Lazy-get or create the Chroma collection for this session."""
     chroma = get_session_client(session_id)
-    return chroma.get_or_create_collection("session")
+    return chroma.get_or_create_collection("session", metadata={"hnsw:space": "cosine"})
 
 def ingest_document(text: str, source_name: str, session_id: str) -> int:
     """
@@ -46,7 +46,7 @@ def ingest_document(text: str, source_name: str, session_id: str) -> int:
     
     print(f"[{session_id}] Encoding {len(chunks)} chunks from {source_name}...")
     embedder = get_embedder()
-    vectors = embedder.encode(texts, show_progress_bar=False, batch_size=64).tolist()
+    vectors = embedder.encode(texts, show_progress_bar=False, batch_size=64, normalize_embeddings=True).tolist()
     
     collection.add(ids=ids, embeddings=vectors, documents=texts, metadatas=metas)
     

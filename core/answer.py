@@ -107,7 +107,7 @@ def get_collection():
     global collection
     if collection is None:
         chroma = ChromaClient(path=DB_NAME)
-        collection = chroma.get_or_create_collection(COLLECTION_NAME)
+        collection = chroma.get_or_create_collection(COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
     return collection
 
 
@@ -116,15 +116,18 @@ from core.session_manager import get_session_client
 def get_arbitrary_collection(session_id: str):
     """Connect to the session's Chroma DB path using the unified cache."""
     chroma = get_session_client(session_id)
-    return chroma.get_or_create_collection("session")
+    return chroma.get_or_create_collection("session", metadata={"hnsw:space": "cosine"})
 
 
-def get_llm(provider: str = "Local (LM Studio)") -> ChatOpenAI:
+def get_llm(provider: str = "Groq - Llama 3.3 70B (Free)") -> ChatOpenAI:
     """Return a cached LLM client for the given provider."""
     if provider not in _llm_cache:
-        cfg = MODEL_PROVIDERS.get(provider, MODEL_PROVIDERS["Local (LM Studio)"])
-        if not cfg["api_key"]:
-            raise ValueError(f"API key for '{provider}' is not set in your .env file.")
+        cfg = MODEL_PROVIDERS.get(provider)
+        if not cfg or not cfg.get("api_key"):
+            raise ValueError(
+                f"API key for provider '{provider}' is not configured. "
+                "Please configure GROQ_API_KEY, MISTRAL_API_KEY, or OPENAI_API_KEY."
+            )
         _llm_cache[provider] = ChatOpenAI(
             temperature=0,
             model_name=cfg["model"],
@@ -134,15 +137,12 @@ def get_llm(provider: str = "Local (LM Studio)") -> ChatOpenAI:
     return _llm_cache[provider]
 
 
-
-
-
 def fetch_context_unranked(question: str, session_id: str | None = None) -> list[Result]:
-    """Embed question and retrieve top-k chunks from Chroma."""
+    """Embed question with normalized embeddings and retrieve top-k chunks from Chroma."""
     coll = get_arbitrary_collection(session_id) if session_id else get_collection()
 
     try:
-        vector = get_embedder().encode([question]).tolist()[0]
+        vector = get_embedder().encode([question], normalize_embeddings=True).tolist()[0]
         results = coll.query(
             query_embeddings=[vector], 
             n_results=RETRIEVAL_K,
@@ -158,10 +158,11 @@ def fetch_context_unranked(question: str, session_id: str | None = None) -> list
         metas = results["metadatas"][0]
         dists = results.get("distances", [[0]*len(docs)])[0]
         for doc, meta, dist in zip(docs, metas, dists):
-            # Relaxed threshold (1.6 instead of 1.2) to tolerate typos 
-            # and short queries while still filtering out complete noise.
-            if dist < 1.6:
-                chunks.append(Result(page_content=doc, metadata=meta or {}))
+            # Cosine distance < 1.4 tolerates slight paraphrasing while rejecting noise
+            if dist < 1.4:
+                metadata = (meta or {}).copy()
+                metadata["_distance"] = float(dist)
+                chunks.append(Result(page_content=doc, metadata=metadata))
     return chunks
 
 
@@ -175,8 +176,22 @@ def merge_chunks(chunks1: list[Result], chunks2: list[Result]) -> list[Result]:
     return merged
 
 
-def rewrite_query(question: str, provider: str = "Local (LM Studio)") -> str:
-    """Rewrite the user question into a tighter KB search query."""
+def should_rewrite_query(question: str) -> bool:
+    """Only rewrite verbose conversational queries to avoid wasting LLM latency on clean queries."""
+    stripped = question.strip()
+    words = stripped.split()
+    if len(words) <= 3:
+        return False
+    lowered = stripped.lower()
+    vague_triggers = ("tell me about", "can you explain", "give me details on", "i want to know", "what can you tell me", "look up", "find information")
+    return any(trigger in lowered for trigger in vague_triggers)
+
+
+def rewrite_query(question: str, provider: str | None = None) -> str:
+    """Rewrite conversational questions into concise queries when needed."""
+    if not provider or not should_rewrite_query(question):
+        return question
+
     prompt = (
         "You are searching a knowledge base.\n"
         "Rewrite the following question into a short, precise search query (one sentence max).\n"
@@ -185,9 +200,48 @@ def rewrite_query(question: str, provider: str = "Local (LM Studio)") -> str:
     )
     try:
         response = get_llm(provider).invoke([SystemMessage(content=prompt)])
-        return response.content.strip()
+        rewritten = response.content.strip()
+        return rewritten if rewritten else question
     except Exception:
         return question
+
+
+def fetch_context_batch_unranked(queries: list[str], session_id: str | None = None) -> list[Result]:
+    """Batch embed multiple queries and retrieve top-k chunks from Chroma in a single vector call."""
+    coll = get_arbitrary_collection(session_id) if session_id else get_collection()
+    unique_queries = list(dict.fromkeys(q.strip() for q in queries if q.strip()))
+    if not unique_queries:
+        return []
+
+    try:
+        vectors = get_embedder().encode(unique_queries, normalize_embeddings=True).tolist()
+        results = coll.query(
+            query_embeddings=vectors,
+            n_results=RETRIEVAL_K,
+            include=["documents", "metadatas", "distances"]
+        )
+    except Exception as e:
+        print(f"Batch retrieval error: {e}")
+        return []
+
+    all_chunks: list[Result] = []
+    seen = set()
+
+    for doc_list, meta_list, dist_list in zip(
+        results.get("documents", []),
+        results.get("metadatas", []),
+        results.get("distances", [])
+    ):
+        for doc, meta, dist in zip(doc_list, meta_list, dist_list):
+            if doc in seen:
+                continue
+            if dist < 1.4:
+                seen.add(doc)
+                metadata = (meta or {}).copy()
+                metadata["_distance"] = float(dist)
+                all_chunks.append(Result(page_content=doc, metadata=metadata))
+
+    return all_chunks
 
 
 # Words that signal a question depends on prior context
@@ -345,39 +399,8 @@ def _unwrap_search_result_url(url: str) -> str:
     return url
 
 
-def fetch_context(question: str, session_id: str | None = None, provider: str = "Local (LM Studio)") -> list[Result]:
-    """Full RAG retrieval: semantic search only, then rerank."""
-    rewritten = rewrite_query(question, provider)
-
-    chunks1 = fetch_context_unranked(question, session_id)
-    chunks2 = fetch_context_unranked(rewritten, session_id)
-    merged = merge_chunks(chunks1, chunks2)
-
-    if not merged:
-        return []
-
-    reranked = rerank(question, merged)[:FINAL_K]
-
-    # Post-rerank relevance gate
-    # Prevents topically-irrelevant chunks from reaching the LLM.
-    if reranked:
-        combined_query = f"{question} {rewritten}"
-        terms = {t for t in re.findall(r"[A-Za-z0-9]+", combined_query.lower()) if len(t) > 1 and t not in _STOP_WORDS}
-        if not terms:
-            return []
-        term_patterns = [re.compile(rf"\b{re.escape(t)}\b") for t in terms]
-        has_overlap = any(
-            any(pattern.search(c.page_content.lower()) for pattern in term_patterns)
-            for c in reranked
-        )
-        if not has_overlap:
-            return []
-
-    return reranked
-
-
 def _filter_relevant_chunks(question: str, rewritten: str, chunks: list[Result]) -> list[Result]:
-    """Keep only reranked chunks that still overlap meaningfully with the query."""
+    """Keep only reranked chunks that still overlap meaningfully with the query or meet semantic confidence."""
     reranked = rerank(question, chunks)[:FINAL_K]
     if not reranked:
         return []
@@ -385,46 +408,59 @@ def _filter_relevant_chunks(question: str, rewritten: str, chunks: list[Result])
     combined_query = f"{question} {rewritten}"
     terms = {t for t in re.findall(r"[A-Za-z0-9]+", combined_query.lower()) if len(t) > 1 and t not in _STOP_WORDS}
     if not terms:
-        return []
+        return reranked
 
     term_patterns = [re.compile(rf"\b{re.escape(t)}\b") for t in terms]
     has_overlap = any(
         any(pattern.search(c.page_content.lower()) for pattern in term_patterns)
         for c in reranked
     )
-    return reranked if has_overlap else []
+    if has_overlap:
+        return reranked
+
+    # Fallback to semantic distance: preserve chunks if top chunk has high embedding similarity
+    best_dist = min((c.metadata.get("_distance", 2.0) for c in reranked), default=2.0)
+    if best_dist < 0.95:
+        return reranked
+
+    return []
+
+
+def fetch_context(question: str, session_id: str | None = None, provider: str | None = None) -> list[Result]:
+    """Full RAG retrieval: batch semantic search and lexical rerank."""
+    rewritten = rewrite_query(question, provider) if provider else question
+    queries = [question] if rewritten == question else [question, rewritten]
+    chunks = fetch_context_batch_unranked(queries, session_id)
+    if not chunks:
+        return []
+    return _filter_relevant_chunks(question, rewritten, chunks)
 
 
 def fetch_context_with_options(
     question: str,
     session_id: str | None = None,
-    provider: str = "Local (LM Studio)",
+    provider: str | None = None,
     allow_web_fallback: bool = False,
     is_custom_mode: bool = False,
 ) -> list[Result]:
     """Retrieve context with optional suppression of web fallback for custom sessions."""
-    # Custom mode is strict: ONLY search the session DB
-    if is_custom_mode:
-        rewritten = rewrite_query(question, provider)
-        chunks1 = fetch_context_unranked(question, session_id)
-        chunks2 = fetch_context_unranked(rewritten, session_id)
-        merged = merge_chunks(chunks1, chunks2)
-        
-        if not merged:
-            if allow_web_fallback:
-                print("No session context found. Falling back to web search...")
-                return fallback_web_search(question)
-            return []
-            
-        filtered = _filter_relevant_chunks(question, rewritten, merged)
-        if not filtered:
-            if allow_web_fallback:
-                print("Session context irrelevant. Falling back to web search...")
-                return fallback_web_search(question)
-        return filtered
+    rewritten = rewrite_query(question, provider) if provider else question
+    queries = [question] if rewritten == question else [question, rewritten]
+    # In custom mode, query session DB; in default mode, query built-in DB
+    target_session = session_id if is_custom_mode else None
+    chunks = fetch_context_batch_unranked(queries, target_session)
+    
+    if not chunks:
+        if allow_web_fallback:
+            print("No context found. Falling back to web search...")
+            return fallback_web_search(question)
+        return []
 
-    # Default mode: Search both global KB and session (session_id)
-    return fetch_context(question, session_id=session_id, provider=provider)
+    filtered = _filter_relevant_chunks(question, rewritten, chunks)
+    if not filtered and allow_web_fallback:
+        print("Retrieved context irrelevant. Falling back to web search...")
+        return fallback_web_search(question)
+    return filtered
 
 
 def build_context(chunks: list[Result], max_chars: int = MAX_CONTEXT_CHARS) -> str:
@@ -446,7 +482,7 @@ def build_context(chunks: list[Result], max_chars: int = MAX_CONTEXT_CHARS) -> s
 def answer_directly(
     question: str,
     history: list[dict] | None = None,
-    provider: str = "Local (LM Studio)",
+    provider: str = "Groq - Llama 3.3 70B (Free)",
     active_context: str = "",
 ) -> tuple[str, list]:
     """Answer without retrieval for math, coding, summaries, and general questions."""
@@ -463,8 +499,15 @@ def answer_directly(
         return response.content, []
     except Exception as e:
         err_str = str(e)
+        if "not configured" in err_str.lower() or "not set" in err_str.lower() or "api key" in err_str.lower():
+            return (
+                f"**AI Model Not Configured for '{provider}'**\n\n"
+                "Please configure an API key in your Hugging Face Space Settings (Variables and secrets) "
+                "or local `.env` (e.g. `GROQ_API_KEY`, `MISTRAL_API_KEY`, or `OPENAI_API_KEY`).",
+                [],
+            )
         return (
-            f"**Could not reach '{provider}'** - {err_str[:200]}\n\n"
+            f"**Could not reach '{provider}'** — {err_str[:200]}\n\n"
             "Please check your API key or try a different provider.",
             [],
         )
@@ -473,7 +516,7 @@ def answer_directly(
 def answer_from_web_search(
     question: str,
     history: list[dict] | None = None,
-    provider: str = "Local (LM Studio)",
+    provider: str = "Groq - Llama 3.3 70B (Free)",
 ) -> tuple[str, list]:
     """Answer using live web search results only."""
     if history is None:
@@ -497,7 +540,7 @@ def answer_from_web_search(
     except Exception as e:
         err_str = str(e)
         answer_text = (
-            f"**Could not reach '{provider}'** - {err_str[:200]}\n\n"
+            f"**Could not reach '{provider}'** — {err_str[:200]}\n\n"
             "---\n*Here are the most relevant web results found:*\n\n"
             f"{context}"
         )
@@ -543,69 +586,43 @@ def classify_input(text: str, provider: str = "Local (LM Studio)") -> str:
         return "query" if first_word in question_starts else "context"
 
 
-def classify_question_intent(question: str, provider: str = "Local (LM Studio)") -> str:
-    """Classify if the question is a simple lookup or an analytical/aggregation query."""
-    llm = get_llm(provider)
-    prompt = f"""Analyze the user's question and classify its intent as either "lookup" or "analytical".
+_ANALYTICAL_KEYWORDS = {
+    "compare", "comparison", "difference", "versus", "vs",
+    "most", "least", "highest", "lowest", "average", "total",
+    "trend", "trends", "aggregate", "distribution", "breakdown",
+    "pattern", "patterns", "rank", "ranking", "how many", "all products", "across",
+    "strategic", "revenue",
+}
 
-- "lookup": The user is asking for a specific fact, definition, or a single entity's details. (e.g. "What does Carllm do?", "Who is Jessica Liu?", "What is the policy limit for X?")
-- "analytical": The user is asking to aggregate, compare, rank, summarize trends, or synthesize across multiple documents or entities. (e.g. "Which product has the most contracts?", "What is the average salary?", "Compare the compliance terms of A and B.")
+def is_analytical_question(question: str) -> bool:
+    """Fast keyword/heuristic intent classifier that requires zero extra LLM API roundtrips."""
+    lowered = question.lower()
+    return any(re.search(rf"\b{re.escape(k)}\b", lowered) for k in _ANALYTICAL_KEYWORDS)
 
-Respond with ONLY the exact word "lookup" or "analytical", nothing else.
 
-Question: {question}
+ANALYTICAL_DIRECTIVE = """
+7. **STRUCTURED SYNTHESIS & COMPARISON**:
+   - Because this question involves analyzing, comparing, ranking, or aggregating across multiple items or documents, first present a clear, concise Markdown table or structured bullet list organizing the relevant facts found in the Context.
+   - Then, provide your direct analysis answering the question based strictly on the table.
+   - If data for some items is missing from the Context, explicitly state the limitation.
 """
-    try:
-        response = llm.invoke([HumanMessage(content=prompt)])
-        result = response.content.strip().lower()
-        return "analytical" if "analytical" in result else "lookup"
-    except Exception:
-        # Fallback heuristic
-        analytical_keywords = {"compare", "most", "highest", "lowest", "average", "trend", "aggregate", "distribution", "pattern", "strategic", "revenue"}
-        return "analytical" if any(k in question.lower() for k in analytical_keywords) else "lookup"
-
-
-def extract_analytical_structure(question: str, chunks: list[Result], provider: str = "Local (LM Studio)") -> str:
-    """Extract structured data from chunks before answering an analytical question."""
-    llm = get_llm(provider)
-    context_text = build_context(chunks)
-    
-    prompt = f"""You are an expert data analyst. The user has asked an analytical question that requires synthesizing data across multiple documents.
-    
-Based on the raw context provided below, extract a structured markdown table or bulleted list containing ALL relevant facts, numbers, and comparisons needed to answer the question. 
-Do not write the final answer to the user—only extract and organize the raw evidence. If the context does not contain enough information, state what is missing.
-
-User's Question: {question}
-
-Raw Context:
-{context_text}
-
-Structured Evidence:
-"""
-    try:
-        response = llm.invoke([HumanMessage(content=prompt)])
-        return response.content.strip()
-    except Exception:
-        return context_text
 
 
 def answer_question(
     question: str,
     history: list[dict] | None = None,
     session_id: str | None = None,
-    provider: str = "Local (LM Studio)",
+    provider: str = "Groq - Llama 3.3 70B (Free)",
     allow_web_fallback: bool = False,
     is_custom_mode: bool = False,
 ) -> tuple[str, list]:
-    """Answer a question using the RAG pipeline. Returns (answer, context_docs)."""
-    from core.session_manager import get_session_db_path
+    """Answer a question using the optimized RAG pipeline. Returns (answer, context_docs)."""
     from core.session_ingest import ingest_document
 
     if history is None:
         history = []
 
     # Resolve follow-up questions into standalone queries for retrieval.
-    # The original question is still used for the LLM answer to preserve tone.
     retrieval_query = condense_question(question, history, provider)
 
     chunks = fetch_context_with_options(
@@ -617,7 +634,6 @@ def answer_question(
     )
 
     # If nothing was found anywhere, return immediately without calling the LLM
-    # to prevent hallucination from training data on empty context.
     if not chunks:
         if session_id:
             if allow_web_fallback:
@@ -647,32 +663,21 @@ def answer_question(
                 )
         return msg, []
 
-    # Check intent to determine if structured aggregation is needed
-    intent = classify_question_intent(retrieval_query, provider)
-
-    if intent == "analytical":
-        structured_context = extract_analytical_structure(retrieval_query, chunks, provider)
-        # Prepend the structured context so the final answer LLM sees it.
-        context = f"=== STRUCTURED AGGREGATION ===\n{structured_context}\n\n=== RAW SOURCE SNIPPETS ===\n{build_context(chunks)}"
-    else:
-        context = build_context(chunks)
-
-    # Use the web fallback prompt when ALL results came from a web search,
-    # so the LLM clearly discloses the answer is not from the user's documents.
+    context = build_context(chunks)
     is_web_fallback = all(c.metadata.get("doc_type") == "web" for c in chunks)
 
     # Automatically store web search results in the session database for future recall
     if is_web_fallback and session_id:
         for chunk in chunks:
-            # Note: We use original question as a pseudo-source for these chunks
-            # so the user knows where they came from in the docs list.
             source = chunk.metadata.get("source", "Web Search")
             ingest_document(chunk.page_content, source, session_id)
 
-    is_web_fallback = all(c.metadata.get("doc_type") == "web" for c in chunks)
-    system_prompt = (
-        WEB_FALLBACK_PROMPT if is_web_fallback else SYSTEM_PROMPT
-    ).format(context=context)
+    if is_web_fallback:
+        system_prompt = WEB_FALLBACK_PROMPT.format(context=context)
+    else:
+        system_prompt = SYSTEM_PROMPT.format(context=context)
+        if is_analytical_question(retrieval_query):
+            system_prompt += f"\n{ANALYTICAL_DIRECTIVE}\n"
 
     messages = [SystemMessage(content=system_prompt)]
     messages.extend(convert_to_messages(history))
@@ -683,20 +688,30 @@ def answer_question(
         answer_text = response.content
     except Exception as e:
         err_str = str(e)
-        # Detect quota / rate-limit errors (HTTP 429)
-        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
+        if "not configured" in err_str.lower() or "not set" in err_str.lower() or "api key" in err_str.lower():
+            answer_text = (
+                f"**AI Model Not Configured for '{provider}'**\n\n"
+                "To generate AI answers, please configure an API key in your Hugging Face Space Settings "
+                "(Settings -> Variables and secrets) or in your `.env`:\n"
+                "- **Groq (Free & Fast)**: Set `GROQ_API_KEY` (free key at [console.groq.com](https://console.groq.com))\n"
+                "- **Mistral (Free Tier)**: Set `MISTRAL_API_KEY` (free key at [console.mistral.ai](https://console.mistral.ai))\n"
+                "- **OpenAI**: Set `OPENAI_API_KEY`\n\n"
+                "---\n*Retrieved Document Passages from Knowledge Base:*\n\n"
+                f"{context}"
+            )
+        elif "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower():
             answer_text = (
                 f"**Rate limit reached for '{provider}'.**\n\n"
                 "Your free-tier quota is exhausted for this model. "
                 "Please switch to a different provider using the dropdown above, "
-                "or wait for your quota to reset (usually within a few minutes or at midnight).\n\n"
-                "---\n*Here is the most relevant context found in the meantime:*\n\n"
+                "or wait a moment for the rate limit window to reset.\n\n"
+                "---\n*Here is the retrieved context found in the meantime:*\n\n"
                 f"{context}"
             )
         else:
             answer_text = (
                 f"**Could not reach '{provider}'** — {err_str[:200]}\n\n"
-                "Please check your API key or try a different provider.\n\n"
+                "Please check your API key or select another provider.\n\n"
                 "---\n*Here is the most relevant context found:*\n\n"
                 f"{context}"
             )

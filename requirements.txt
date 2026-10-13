@@ -36,3 +36,5 @@ requests
 beautifulsoup4
 lxml
 ddgs
+huggingface_hub
+certifi

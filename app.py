@@ -9,7 +9,7 @@ import gradio as gr
 import pandas as pd
 
 from core.answer import answer_directly, answer_from_web_search, answer_question
-from core.config import AVAILABLE_PROVIDERS
+from core.config import AVAILABLE_PROVIDERS, NO_PROVIDER_PLACEHOLDER
 from core.extractors import extract_file, extract_url, structure_as_markdown
 from core.session_ingest import ingest_document
 from core.ingest import ingest_all
@@ -641,7 +641,7 @@ def main():
     }
     """
 
-    blocks_kwargs = {"title": "DocuFlux AI", "css": custom_css}
+    blocks_kwargs = {"title": "Knovera", "css": custom_css}
     launch_kwargs = {"ssr_mode": False}
     if gradio_major >= 6:
         launch_kwargs["theme"] = theme
@@ -658,7 +658,7 @@ def main():
 
         with gr.Row(equal_height=True):
             gr.Markdown(
-                "# DocuFlux AI\n"
+                "# Knovera\n"
                 "Default mode answers from the built-in KB. Custom mode searches your documents first, "
                 "then can answer simple math, coding, summaries, and general questions directly."
             )
@@ -680,6 +680,16 @@ def main():
                         info="Only configured providers are shown.",
                         scale=1,
                     )
+
+                if NO_PROVIDER_PLACEHOLDER in AVAILABLE_PROVIDERS:
+                    with gr.Row():
+                        gr.Markdown(
+                            "> ⚠️ **Configuration Notice**: No LLM API key detected. "
+                            "To enable AI answer generation, add `GROQ_API_KEY` (free at [console.groq.com](https://console.groq.com)), "
+                            "`MISTRAL_API_KEY` (free at [console.mistral.ai](https://console.mistral.ai)), or "
+                            "`OPENAI_API_KEY` under **Space Settings → Variables and secrets** (or in `.env`). "
+                            "Document retrieval and context search remain fully functional!"
+                        )
 
                 with gr.Row():
                     with gr.Column(scale=2):

@@ -19,8 +19,36 @@ def get_session_client(session_id: str):
     return _session_clients[session_id]
 
 
+import time
+
+_MAX_CONCURRENT_SESSIONS = 25
+_SESSION_TTL_SECONDS = 7200  # 2 hours
+
+
+def _cleanup_stale_sessions() -> None:
+    """Purge sessions older than TTL or keep at most _MAX_CONCURRENT_SESSIONS."""
+    if not TEMP_DIR.exists():
+        return
+    now = time.time()
+    try:
+        session_dirs = [d for d in TEMP_DIR.iterdir() if d.is_dir()]
+        for d in session_dirs:
+            # Check age
+            if now - d.stat().st_mtime > _SESSION_TTL_SECONDS:
+                destroy_session(d.name)
+        # If still over max, destroy oldest
+        remaining = [d for d in TEMP_DIR.iterdir() if d.is_dir()]
+        if len(remaining) > _MAX_CONCURRENT_SESSIONS:
+            remaining.sort(key=lambda p: p.stat().st_mtime)
+            for d in remaining[:len(remaining) - _MAX_CONCURRENT_SESSIONS]:
+                destroy_session(d.name)
+    except Exception as e:
+        print(f"[Session Cleanup] Warning: {e}")
+
+
 def create_session() -> str:
     """Generate UUID, create temp dirs, return session_id."""
+    _cleanup_stale_sessions()
     session_id = str(uuid.uuid4())
     (TEMP_DIR / session_id / "vector_db").mkdir(parents=True, exist_ok=True)
     _session_sizes[session_id] = 0
